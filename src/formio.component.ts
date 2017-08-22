@@ -1,38 +1,117 @@
-import 'core-js/es7/reflect';
-import { Component, Input, Output, EventEmitter, OnInit }  from '@angular/core';
-import { FormGroup } from '@angular/forms';
+import { Component, Input, Output, EventEmitter, OnInit, ViewEncapsulation, Optional, ElementRef, ViewChild }  from '@angular/core';
 import { FormioService } from './formio.service';
-import { FormioForm, FormioOptions } from './formio.common';
-import { FormioEvents } from './formio.events';
-import { BehaviorSubject } from 'rxjs/BehaviorSubject';
+import { FormioLoader } from './formio.loader';
+import { FormioAlerts } from './formio.alerts';
+import { FormioAppConfig } from './formio.config';
+import { FormioForm, FormioOptions, FormioError, FormioRefreshValue } from './formio.common';
+let Promise = require('native-promise-only');
+let Formio = require('formiojs/full');
+let _each = require('lodash/each');
 
-/**
- * The <formio> component.
- */
 @Component({
     selector: 'formio',
-    template: '<div></div>'
+    template: '<div>' +
+        '<formio-loader></formio-loader>' +
+        '<formio-alerts></formio-alerts>' +
+        '<div #formio></div>' +
+    '</div>',
+    styles: ['@@import formio.component.css'],
+    encapsulation: ViewEncapsulation.None
 })
 export class FormioComponent implements OnInit {
-    public formGroup: FormGroup = new FormGroup({});
-    public ready: BehaviorSubject<boolean> = new BehaviorSubject(false);
+    public ready: Promise<boolean>;
+    public readyResolve: any;
     @Input() form: FormioForm = null;
     @Input() submission: any = {};
     @Input() src: string;
+    @Input() url: string;
     @Input() service: FormioService;
     @Input() options: FormioOptions;
     @Input() readOnly: boolean = false;
+    @Input() hideComponents: Array<string>;
+    @Input() refresh: EventEmitter<FormioRefreshValue>;
     @Output() render: EventEmitter<Object>;
+    @Output() customEvent: EventEmitter<Object>;
     @Output() submit: EventEmitter<Object>;
+    @Output() prevPage: EventEmitter<Object>;
+    @Output() nextPage: EventEmitter<Object>;
     @Output() beforeSubmit: EventEmitter<Object>;
     @Output() change: EventEmitter<Object>;
     @Output() invalid: EventEmitter<boolean>;
-    constructor(public events: FormioEvents) {
-        this.beforeSubmit = this.events.onBeforeSubmit;
-        this.submit = this.events.onSubmit;
-        this.change = this.events.onChange;
-        this.render = this.events.onRender;
-        this.invalid = this.events.onInvalid;
+    @Output() error: EventEmitter<any>;
+    @Output() formLoad: EventEmitter<any>;
+    @ViewChild('formio') formioElement:ElementRef;
+
+    private formio: any;
+    constructor(
+        private loader: FormioLoader,
+        private alerts: FormioAlerts,
+        @Optional() private config: FormioAppConfig
+    ) {
+        if (this.config) {
+            Formio.Formio.setBaseUrl(this.config.apiUrl);
+            Formio.Formio.setAppUrl(this.config.appUrl);
+        }
+        else {
+            console.warn('You must provide an AppConfig within your application!');
+        }
+
+        this.ready = new Promise((resolve: any) => {
+            this.readyResolve = resolve;
+        });
+
+        this.beforeSubmit = new EventEmitter();
+        this.prevPage = new EventEmitter();
+        this.nextPage = new EventEmitter();
+        this.submit = new EventEmitter();
+        this.error = new EventEmitter();
+        this.invalid = new EventEmitter();
+        this.change = new EventEmitter();
+        this.customEvent = new EventEmitter();
+        this.render = new EventEmitter();
+        this.formLoad = new EventEmitter();
+        this.alerts.alerts = [];
+    }
+    setForm(form: FormioForm) {
+        this.form = form;
+
+        // Only initialize a single formio instance.
+        if (this.formio) {
+            this.formio.form = this.form;
+            return;
+        }
+        if (this.form.display === 'wizard') {
+            this.formio = new Formio.FormioWizard(null, {
+                noAlerts: true,
+                readOnly: this.readOnly
+            });
+        }
+        else {
+            this.formio = new Formio.FormioForm(null, {
+                noAlerts: true,
+                readOnly: this.readOnly
+            });
+        }
+
+        if (this.url) {
+            this.formio.url = this.url;
+        }
+        if (this.src) {
+            this.formio.url = this.src;
+        }
+        this.formio.nosubmit = true;
+        this.formio.on('prevPage', (data: any) => this.onPrevPage(data));
+        this.formio.on('nextPage', (data: any) => this.onNextPage(data));
+        this.formio.on('change', (value: any) => this.change.emit(value));
+        this.formio.on('customEvent', (event: any) => this.customEvent.emit(event));
+        this.formio.on('submit', (submission: any) => this.submitForm(submission));
+        this.formio.on('error', (err: any) => this.onError(err));
+        this.formio.on('render', () => this.render.emit(true));
+        this.formio.on('formLoad', (form: any) => this.formLoad.emit(form));
+        this.formio.setElement(this.formioElement.nativeElement);
+        this.formio.form = this.form;
+        this.loader.loading = false;
+        this.readyResolve();
     }
     ngOnInit() {
         this.options = Object.assign({
@@ -41,84 +120,125 @@ export class FormioComponent implements OnInit {
             },
             alerts: {
                 submitMessage: 'Submission Complete.'
+            },
+            hooks: {
+                beforeSubmit: null
             }
         }, this.options);
 
-        if (this.form) {
-            this.ready.next(true);
+        if (this.refresh) {
+            this.refresh.subscribe((refresh: FormioRefreshValue) => this.onRefresh(refresh));
         }
-        else if (this.src && !this.service) {
-            this.service = new FormioService(this.src);
+
+        if (this.src) {
+            if (!this.service) {
+                this.service = new FormioService(this.src);
+            }
+            this.loader.loading = true;
             this.service.loadForm().subscribe((form: FormioForm) => {
                 if (form && form.components) {
-                    this.form = form;
-                    this.ready.next(true);
+                    this.setForm(form);
                 }
 
-                // If a submission is also provided.
-                if (this.service.formio.submissionId) {
+                // if a submission is also provided.
+                if (!this.submission && this.service.formio.submissionId) {
                     this.service.loadSubmission().subscribe((submission: any) => {
-                        this.submission = submission;
-                        this.formGroup.setValue(submission.data);
-                        this.formGroup.disable();
-                    });
+                        this.submission = this.formio.submission = submission;
+                    }, (err) => this.onError(err));
                 }
-            });
-        }
-
-        // Subscribe to value changes.
-        //noinspection TypeScriptUnresolvedFunction
-        this.formGroup.valueChanges
-            .debounceTime(100)
-            .subscribe((value: any) => {
-                this.events.onChange.emit(value);
-            });
-
-        // If this is a read only form, then disable the formGroup.
-        if (this.readOnly) {
-            this.formGroup.disable();
+            }, (err) => this.onError(err));
         }
     }
-    onRender() {
-        this.events.onRender.emit(true);
+    onRefresh(refresh: FormioRefreshValue) {
+        switch (refresh.property) {
+            case 'submission':
+                this.formio.submission = refresh.value;
+                break;
+            case 'form':
+                this.formio.form = refresh.value;
+                break;
+        }
     }
-    onSubmit($event: any) {
-        if ($event) {
-            $event.preventDefault();
-            $event.stopPropagation();
+    ngOnChanges(changes: any) {
+        if (changes.form && changes.form.currentValue) {
+            this.setForm(changes.form.currentValue);
         }
 
-        // Reset the errors and alerts.
-        this.events.errors = [];
-        this.events.alerts = [];
+        this.ready.then(() => {
+            if (changes.submission && changes.submission.currentValue) {
+                this.formio.submission = changes.submission.currentValue;
+            }
 
-        // Check if the form is valid.
-        if (!this.formGroup.valid) {
-            this.formGroup.markAsDirty(true);
-            this.events.onInvalid.emit(true);
+            if (changes.hideComponents) {
+                this.formio.hideComponents(changes.hideComponents.currentValue);
+            }
+        });
+    }
+    onPrevPage(data: any) {
+        this.alerts.setAlerts([]);
+        this.prevPage.emit(data)
+    }
+    onNextPage(data: any) {
+        this.alerts.setAlerts([]);
+        this.nextPage.emit(data)
+    }
+    onSubmit(submission: any, saved: boolean) {
+        if (saved) {
+            this.formio.emit('submitDone', submission);
+        }
+        this.submit.emit(submission);
+        this.alerts.setAlert({
+            type: 'success',
+            message: this.options.alerts.submitMessage
+        });
+    }
+    onError(err: any) {
+        this.alerts.setAlerts([]);
+        if (!err) {
             return;
         }
 
-        let submission = {data: this.formGroup.value};
+        // Make sure it is an array.
+        err = (err instanceof Array) ? err : [err];
 
-        // Trigger to components that we are submitting.
-        this.events.onBeforeSubmit.emit(submission);
+        // Emit these errors again.
+        this.error.emit(err);
 
+        // Iterate through each one and set the alerts array.
+        _each(err, (error: any) => {
+            this.alerts.setAlert({
+                type: 'danger',
+                message: error.message || error.toString()
+            });
+        });
+    }
+    submitExecute(submission: Object) {
         if (this.service) {
-            this.service.saveSubmission(submission).subscribe((sub: {}) => {
-                this.events.onSubmit.emit(sub);
-                this.events.alerts.push({
-                    type: 'success',
-                    message: this.options.alerts.submitMessage
-                });
+            this.service.saveSubmission(submission).subscribe(
+                (sub: {}) => this.onSubmit(sub, true),
+                (err) => this.onError(err)
+            );
+        }
+        else {
+            this.onSubmit(submission, false);
+        }
+    }
+    submitForm(submission: any) {
+        this.beforeSubmit.emit(submission);
+
+        // if they provide a beforeSubmit hook, then allow them to alter the submission asynchronously
+        // or even provide a custom Error method.
+        if (this.options.hooks.beforeSubmit) {
+            this.options.hooks.beforeSubmit(submission, (err: FormioError, sub: Object) => {
+                if (err) {
+                    this.onError(err);
+                    return;
+                }
+                this.submitExecute(sub);
             });
         }
         else {
-            this.events.onSubmit.emit(submission);
-            this.events.alerts.push({
-                type: 'success',
-                message: this.options.alerts.submitMessage
-            });
+            this.submitExecute(submission);
         }
     }
 }

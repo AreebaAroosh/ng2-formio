@@ -1,24 +1,29 @@
-var gulp = require('gulp');
-var del = require('del');
-var rename = require('gulp-rename');
-var debug = require('gulp-debug');
-var insert = require('gulp-insert');
-var injectHtml = require('gulp-inject-stringified-html');
-
-gulp.task('templates', function () {
-  return gulp.src('src/templates/bootstrap.templates.tpl.ts')
-    .pipe(injectHtml())
-    .pipe(rename(function (path) {
-      path.basename = path.basename.substr(0, path.basename.indexOf('.tpl'));
-      path.extname = '.ts';
-    }))
-    .pipe(insert.prepend('// THIS IS A GENERATED FILE. DO NOT MODIFY!!!' + "\n"))
-    .pipe(debug({
-      title: 'templates:'
-    }))
-    .pipe(gulp.dest('src/templates'));
+'use strict';
+const gulp = require('gulp');
+const gulpsync = require('gulp-sync')(gulp);
+const replace = require('gulp-replace');
+const inject = require('gulp-js-text-inject');
+const sass = require('gulp-sass');
+const cleanCSS = require('gulp-clean-css');
+var exec = require('child_process').exec;
+gulp.task('styles', () => {
+    return gulp.src(['./src/formio.component.scss'])
+        .pipe(sass().on('error', sass.logError))
+        .pipe(cleanCSS({compatibility: 'ie8'}))
+        .pipe(gulp.dest('src'));
 });
-
-gulp.task('clean', function () {
-  return del(['dist/**/*']);
+gulp.task('inline-style', () => {
+    return gulp.src(['./src/formio.component.js'])
+        .pipe(inject({
+            basepath: 'src/'
+        }))
+        .pipe(gulp.dest('src'));
 });
+gulp.task('scripts', (done) => {
+  exec('ngc -p "tsconfig.json"', function (err, stdout, stderr) {
+    console.log(stdout);
+    console.log(stderr);
+    done();
+  });
+});
+gulp.task('build', gulpsync.sync([['styles'], ['scripts'], 'inline-style']));
